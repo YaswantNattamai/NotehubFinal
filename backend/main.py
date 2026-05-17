@@ -57,20 +57,6 @@ except Exception as e:
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
-def get_db():
-    database_url = os.getenv("DATABASE_URL")
-    if database_url and database_url.startswith("postgres"):
-        import psycopg2
-        import psycopg2.extras
-        conn = psycopg2.connect(database_url)
-        # Use DictCursor for sqlite3.Row compatibility
-        return conn
-    
-    db_path = os.getenv("DB_PATH", "notehub.db")
-    conn = sqlite3.connect(db_path, timeout=20)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 class DBWrapper:
     """Helper to unify sqlite3 and psycopg2 interface for simple queries"""
     def __init__(self, conn):
@@ -109,13 +95,24 @@ class DBWrapper:
     @property
     def total_changes(self):
         if self.is_postgres:
-            # Not directly available in same way, but usually checked via rowcount
             return 1 # Fallback for now
         return self.conn.total_changes
 
+def get_db():
+    database_url = os.getenv("DATABASE_URL")
+    if database_url and database_url.startswith("postgres"):
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(database_url)
+        return DBWrapper(conn)
+    
+    db_path = os.getenv("DB_PATH", "notehub.db")
+    conn = sqlite3.connect(db_path, timeout=20)
+    conn.row_factory = sqlite3.Row
+    return DBWrapper(conn)
+
 def init_db():
-    conn = get_db()
-    db = DBWrapper(conn)
+    db = get_db()
     
     blob_type = "BYTEA" if db.is_postgres else "BLOB"
     
@@ -362,8 +359,7 @@ class ReorderRequest(BaseModel):
 
 @app.post("/auth/signup")
 def signup(body: SignupRequest):
-    conn = get_db()
-    db = DBWrapper(conn)
+    db = get_db()
     
     # Check email
     existing_email = db.fetchone("SELECT id FROM users WHERE email = ?", (body.email,))
@@ -409,8 +405,7 @@ class VerifyRequest(BaseModel):
 
 @app.post("/auth/verify")
 def verify_email(body: VerifyRequest):
-    conn = get_db()
-    db = DBWrapper(conn)
+    db = get_db()
     user = db.fetchone("SELECT * FROM users WHERE email = ? AND otp_code = ?", (body.email, body.otp))
     if not user:
         db.close()
@@ -423,8 +418,7 @@ def verify_email(body: VerifyRequest):
 
 @app.post("/auth/login")
 def login(body: LoginRequest):
-    conn = get_db()
-    db = DBWrapper(conn)
+    db = get_db()
     user = db.fetchone(
         "SELECT * FROM users WHERE email = ?",
         (body.email,)
@@ -456,8 +450,7 @@ def login(body: LoginRequest):
 
 @app.get("/auth/me")
 def me(user_id: str = Depends(verify_token)):
-    conn = get_db()
-    db = DBWrapper(conn)
+    db = get_db()
     user = db.fetchone("SELECT id, name, email, created_at FROM users WHERE id = ?", (user_id,))
     db.close()
     if not user:
