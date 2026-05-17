@@ -11,6 +11,7 @@ import datetime
 import base64
 import os
 import uuid
+import bcrypt
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,6 +25,7 @@ from reportlab.lib.units import inch
 import textwrap
 import requests as http_requests
 import base64 as b64
+import boto3
 
 app = FastAPI(title="NoteHub API", version="1.0.0")
 
@@ -40,17 +42,79 @@ ALGORITHM = "HS256"
 PASSWORD_SALT = "notehub-salt-v1" # Simple salt for sha256
 security = HTTPBearer()
 
+# ── AWS Config ────────────────────────────────────────────────────────────────
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+
+# Initialize clients (will use environment/IAM role credentials)
+textract = boto3.client("textract", region_name=AWS_REGION)
+s3 = boto3.client("s3", region_name=AWS_REGION)
+
 # ── Database ──────────────────────────────────────────────────────────────────
 
 def get_db():
+    database_url = os.getenv("DATABASE_URL")
+    if database_url and database_url.startswith("postgres"):
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(database_url)
+        # Use DictCursor for sqlite3.Row compatibility
+        return conn
+    
     db_path = os.getenv("DB_PATH", "notehub.db")
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=20)
     conn.row_factory = sqlite3.Row
     return conn
 
+class DBWrapper:
+    """Helper to unify sqlite3 and psycopg2 interface for simple queries"""
+    def __init__(self, conn):
+        self.conn = conn
+        self.is_postgres = hasattr(conn, 'cursor_factory') or 'psycopg2' in str(type(conn))
+
+    def execute(self, query, params=None):
+        # Convert ? to %s for postgres
+        if self.is_postgres:
+            query = query.replace("?", "%s")
+            import psycopg2.extras
+            cur = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            cur.execute(query, params or ())
+            return cur
+        else:
+            return self.conn.execute(query, params or ())
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+    def fetchone(self, cursor_or_query, params=None):
+        if isinstance(cursor_or_query, str):
+            cur = self.execute(cursor_or_query, params)
+            return cur.fetchone()
+        return cursor_or_query.fetchone()
+
+    def fetchall(self, cursor_or_query, params=None):
+        if isinstance(cursor_or_query, str):
+            cur = self.execute(cursor_or_query, params)
+            return cur.fetchall()
+        return cursor_or_query.fetchall()
+
+    @property
+    def total_changes(self):
+        if self.is_postgres:
+            # Not directly available in same way, but usually checked via rowcount
+            return 1 # Fallback for now
+        return self.conn.total_changes
+
 def init_db():
     conn = get_db()
-    conn.execute("""
+    db = DBWrapper(conn)
+    
+    blob_type = "BYTEA" if db.is_postgres else "BLOB"
+    
+    db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -62,7 +126,7 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
-    conn.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -75,7 +139,7 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
-    conn.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS channels (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -85,7 +149,7 @@ def init_db():
             FOREIGN KEY (admin_id) REFERENCES users(id)
         )
     """)
-    conn.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS channel_members (
             channel_id TEXT NOT NULL,
             user_id TEXT NOT NULL,
@@ -105,23 +169,22 @@ def init_db():
         "ALTER TABLE channel_members ADD COLUMN role TEXT NOT NULL DEFAULT 'member'"
     ]:
         try:
-            conn.execute(query)
-            conn.commit()
-            print(f"Migration success: {query}")
-        except sqlite3.OperationalError as e:
-            if "duplicate column name" in str(e) or "already exists" in str(e):
-                pass
-            else:
+            db.execute(query)
+            db.commit()
+        except Exception as e:
+            # Ignore duplicate column errors
+            if "duplicate" not in str(e).lower() and "already exists" not in str(e).lower():
                 print(f"Migration error for {query}: {e}")
         
     try:
-        conn.execute("ALTER TABLE channel_notes ADD COLUMN order_index INTEGER DEFAULT 0")
-        conn.execute("ALTER TABLE channel_notes ADD COLUMN heading TEXT")
-        conn.execute("ALTER TABLE channel_notes ADD COLUMN subheading TEXT")
-    except sqlite3.OperationalError:
+        db.execute("ALTER TABLE channel_notes ADD COLUMN order_index INTEGER DEFAULT 0")
+        db.execute("ALTER TABLE channel_notes ADD COLUMN heading TEXT")
+        db.execute("ALTER TABLE channel_notes ADD COLUMN subheading TEXT")
+        db.commit()
+    except:
         pass
         
-    conn.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS channel_notes (
             id TEXT PRIMARY KEY,
             channel_id TEXT NOT NULL,
@@ -137,7 +200,7 @@ def init_db():
             FOREIGN KEY (submitted_by) REFERENCES users(id)
         )
     """)
-    conn.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS notifications (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -150,32 +213,42 @@ def init_db():
             FOREIGN KEY (sender_id) REFERENCES users(id)
         )
     """)
-    conn.execute("""
+    db.execute(f"""
         CREATE TABLE IF NOT EXISTS document_pages (
             id TEXT PRIMARY KEY,
             document_id TEXT NOT NULL,
             page_number INTEGER NOT NULL,
-            image_bytes BLOB,
+            image_bytes {blob_type},
             extracted_text TEXT,
             FOREIGN KEY (document_id) REFERENCES documents(id)
         )
     """)
-    conn.commit()
-    conn.close()
+    db.commit()
+    db.close()
 
 init_db()
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256((password + PASSWORD_SALT).encode()).hexdigest()
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode(), salt).decode()
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode(), hashed.encode())
+    except:
+        return False
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    if "exp" not in to_encode:
+        expire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+        to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def create_token(user_id: str) -> str:
-    payload = {
-        "sub": user_id,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=30)
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return create_access_token({"sub": user_id})
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     try:
@@ -275,29 +348,22 @@ class ReorderRequest(BaseModel):
 @app.post("/auth/signup")
 def signup(body: SignupRequest):
     conn = get_db()
-    
-    # Self-healing migrations
-    try:
-        conn.execute("SELECT username FROM users LIMIT 1")
-    except sqlite3.OperationalError:
-        try:
-            conn.execute("ALTER TABLE users ADD COLUMN username TEXT")
-            conn.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1")
-            conn.execute("ALTER TABLE users ADD COLUMN otp_code TEXT")
-            conn.commit()
-        except:
-            pass
+    db = DBWrapper(conn)
     
     # Check email
-    existing_email = conn.execute("SELECT id FROM users WHERE email = ?", (body.email,)).fetchone()
+    existing_email = db.fetchone("SELECT id FROM users WHERE email = ?", (body.email,))
     if existing_email:
-        conn.close()
+        db.close()
         raise HTTPException(status_code=400, detail="Email already registered")
         
     # Check username
-    existing_user = conn.execute("SELECT id FROM users WHERE username = ?", (body.username.lower(),)).fetchone()
+    if not body.username.strip():
+        db.close()
+        raise HTTPException(status_code=400, detail="Username cannot be empty")
+        
+    existing_user = db.fetchone("SELECT id FROM users WHERE username = ?", (body.username.lower(),))
     if existing_user:
-        conn.close()
+        db.close()
         raise HTTPException(status_code=400, detail="Username already taken")
     
     user_id = str(uuid.uuid4())
@@ -310,12 +376,12 @@ def signup(body: SignupRequest):
     # Auto-verify specific accounts
     is_verified = 1 if body.email in ['bruh@bruh', 'admin@admin'] else 0
     
-    conn.execute(
+    db.execute(
         "INSERT INTO users (id, name, username, email, password_hash, is_verified, otp_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (user_id, body.name, body.username.lower(), body.email, hash_password(body.password), is_verified, otp, created_at)
     )
-    conn.commit()
-    conn.close()
+    db.commit()
+    db.close()
     
     # Send email
     send_otp_email(body.email, otp)
@@ -329,55 +395,56 @@ class VerifyRequest(BaseModel):
 @app.post("/auth/verify")
 def verify_email(body: VerifyRequest):
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE email = ? AND otp_code = ?", (body.email, body.otp)).fetchone()
+    db = DBWrapper(conn)
+    user = db.fetchone("SELECT * FROM users WHERE email = ? AND otp_code = ?", (body.email, body.otp))
     if not user:
-        conn.close()
+        db.close()
         raise HTTPException(status_code=400, detail="Invalid OTP")
         
-    conn.execute("UPDATE users SET is_verified = 1, otp_code = NULL WHERE id = ?", (user["id"],))
-    conn.commit()
-    conn.close()
+    db.execute("UPDATE users SET is_verified = 1, otp_code = NULL WHERE id = ?", (user["id"],))
+    db.commit()
+    db.close()
     return {"success": True}
 
 @app.post("/auth/login")
 def login(body: LoginRequest):
     conn = get_db()
-    user = conn.execute(
+    db = DBWrapper(conn)
+    user = db.fetchone(
         "SELECT * FROM users WHERE email = ?",
         (body.email,)
-    ).fetchone()
+    )
     
     if not user:
-        conn.close()
+        db.close()
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Password bypass for test accounts as requested
+    # Password bypass for test accounts
     is_test_account = user["email"] in ['bruh@bruh', 'admin@admin']
     
-    if not is_test_account and user["password_hash"] != hash_password(body.password):
-        conn.close()
+    if not is_test_account and not verify_password(body.password, user["password_hash"]):
+        db.close()
         raise HTTPException(status_code=401, detail="Invalid password")
     
-    # Auto-verify test accounts on login if they aren't verified yet
     if user["is_verified"] == 0 and is_test_account:
-        conn.execute("UPDATE users SET is_verified = 1 WHERE id = ?", (user["id"],))
-        conn.commit()
-        # Refresh user record
-        user = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        db.execute("UPDATE users SET is_verified = 1 WHERE id = ?", (user["id"],))
+        db.commit()
+        user = db.fetchone("SELECT * FROM users WHERE id = ?", (user["id"],))
 
     if user["is_verified"] == 0:
-        conn.close()
+        db.close()
         raise HTTPException(status_code=403, detail="Email not verified")
         
-    token = create_token(user["id"])
-    conn.close()
+    token = create_access_token({"sub": user["id"]})
+    db.close()
     return {"token": token, "user": dict(user)}
 
 @app.get("/auth/me")
 def me(user_id: str = Depends(verify_token)):
     conn = get_db()
-    user = conn.execute("SELECT id, name, email, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
-    conn.close()
+    db = DBWrapper(conn)
+    user = db.fetchone("SELECT id, name, email, created_at FROM users WHERE id = ?", (user_id,))
+    db.close()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return dict(user)
@@ -457,28 +524,23 @@ def warp_perspective(image_bytes: bytes, points: List[dict]) -> bytes:
 
 def extract_text_from_image(image_bytes: bytes) -> str:
     try:
-        processed = preprocess_image(image_bytes)
-        image_b64 = b64.b64encode(processed).decode("utf-8")
-
-        ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
-        ollama_model = os.getenv("OLLAMA_MODEL", "llava")
-        res = http_requests.post(
-            f"{ollama_url}/api/generate",
-            json={
-                "model": ollama_model,
-                "prompt": "Extract all text from this image exactly as written, including any handwriting. Return only the extracted text, nothing else.",
-                "images": [image_b64],
-                "stream": False
-            },
-            timeout=480  # 8 min — llama3.2-vision is heavier, needs more time on CPU
-        )
-
-        result = res.json()
-        print("OLLAMA RESPONSE:", result.get("response", "")[:200])
-        return result["response"].strip()
-
+        # Use AWS Textract for high-accuracy handwriting recognition
+        response = textract.detect_document_text(Document={'Bytes': image_bytes})
+        
+        extracted_text = ""
+        for item in response.get('Blocks', []):
+            if item['BlockType'] == 'LINE':
+                extracted_text += item['Text'] + "\n"
+        
+        return extracted_text.strip()
     except Exception as e:
+        print(f"Textract Error: {e}")
+        # Fallback to empty string or error message
         return f"[OCR Error: {str(e)}]"
+
+def build_ocr_prompt(image_bytes: bytes) -> dict:
+    """No longer used with Textract, kept for compatibility if needed"""
+    return {}
     
 def create_pdf(title: str, pages: List[dict]) -> bytes:
     """
@@ -678,35 +740,61 @@ async def create_document(request: Request, user_id: str = Depends(verify_token)
         all_text.append(text)
 
     pdf_bytes = create_pdf(title, pages)
-    pdf_b64 = base64.b64encode(pdf_bytes).decode()
     combined_text = "\n\n--- Page Break ---\n\n".join(all_text)
 
     doc_id = str(uuid.uuid4())
     created_at = datetime.datetime.utcnow().isoformat()
 
+    # S3 Storage for PDF
+    pdf_location = None
+    if S3_BUCKET_NAME:
+        try:
+            pdf_key = f"documents/{user_id}/{doc_id}.pdf"
+            s3.put_object(Bucket=S3_BUCKET_NAME, Key=pdf_key, Body=pdf_bytes, ContentType="application/pdf")
+            pdf_location = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{pdf_key}"
+        except Exception as e:
+            print(f"S3 PDF Upload Error: {e}")
+            pdf_location = base64.b64encode(pdf_bytes).decode()
+    else:
+        pdf_location = base64.b64encode(pdf_bytes).decode()
+
     conn = get_db()
-    conn.execute(
+    db = DBWrapper(conn)
+    db.execute(
         "INSERT INTO documents (id, user_id, title, extracted_text, pdf_base64, image_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (doc_id, user_id, title, combined_text, pdf_b64, len(image_files), created_at)
+        (doc_id, user_id, title, combined_text, pdf_location, len(image_files), created_at)
     )
     
     # Save individual pages
     for idx, page in enumerate(pages):
         page_id = str(uuid.uuid4())
-        conn.execute(
+        image_data = page["image_bytes"]
+        
+        # S3 Storage for page image (optional, but good for cloud)
+        if S3_BUCKET_NAME and image_data:
+            try:
+                image_key = f"pages/{doc_id}/{page_id}.jpg"
+                s3.put_object(Bucket=S3_BUCKET_NAME, Key=image_key, Body=image_data, ContentType="image/jpeg")
+                # For simplicity, we still store bytes in DB if using SQLite, or we could switch to URLs
+                # But to avoid breaking other routes, we'll keep BLOB/BYTEA for now unless it's too large
+            except Exception as e:
+                print(f"S3 Image Upload Error: {e}")
+
+        db.execute(
             "INSERT INTO document_pages (id, document_id, page_number, image_bytes, extracted_text) VALUES (?, ?, ?, ?, ?)",
-            (page_id, doc_id, idx, page["image_bytes"], page["text"])
+            (page_id, doc_id, idx, image_data, page["text"])
         )
         
-    conn.commit()
-    conn.close()
+    db.commit()
+    db.close()
 
     return {
         "id": doc_id,
         "title": title,
         "extracted_text": combined_text,
         "image_count": len(image_files),
-        "created_at": created_at
+        "created_at": created_at,
+        "pdf_url": pdf_location if pdf_location.startswith("http") else None
     }
 
 class DocumentTextCreate(BaseModel):
@@ -1173,7 +1261,7 @@ def delete_channel_note(channel_id: str, submission_id: str, user_id: str = Depe
 class BulkNoteUpdate(BaseModel):
     updates: List[dict] # Each dict: {"submission_id": str, "extracted_text": str, "heading": str, "subheading": str}
 
-@app.post("/channels/{channel_id}/notes/bulk-update")
+@app.post("/channels/notes/bulk-update")
 def bulk_update_channel_notes(channel_id: str, body: BulkNoteUpdate, user_id: str = Depends(verify_token)):
     conn = get_db()
     channel = conn.execute("SELECT admin_id FROM channels WHERE id = ?", (channel_id,)).fetchone()

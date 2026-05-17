@@ -87,10 +87,22 @@ export default function DocsScreen() {
     setDownloading(true);
     try {
       const res = await api.get(`/documents/${doc.id}`);
+      const pdfData = res.data.pdf_base64;
       const path = FileSystem.documentDirectory + `${doc.title.replace(/\s+/g, "_")}.pdf`;
-      await FileSystem.writeAsStringAsync(path, res.data.pdf_base64, { encoding: FileSystem.EncodingType.Base64 });
+
+      if (pdfData.startsWith("http")) {
+        // Handle S3 URL
+        await FileSystem.downloadAsync(pdfData, path);
+      } else {
+        // Handle local base64 (legacy/SQLite)
+        await FileSystem.writeAsStringAsync(path, pdfData, { encoding: FileSystem.EncodingType.Base64 });
+      }
+      
       await Sharing.shareAsync(path, { mimeType: "application/pdf" });
-    } catch { show("Error", "Could not download PDF."); }
+    } catch (err) { 
+      console.error("Download error:", err);
+      show("Error", "Could not download PDF."); 
+    }
     finally { setDownloading(false); }
   }
 
