@@ -532,6 +532,10 @@ def warp_perspective(image_bytes: bytes, points: List[dict]) -> bytes:
 
 def extract_text_from_image(image_bytes: bytes) -> str:
     try:
+        global textract
+        if textract is None:
+            textract = boto3.client("textract", region_name=AWS_REGION)
+            
         # Use AWS Textract for high-accuracy handwriting recognition
         response = textract.detect_document_text(Document={'Bytes': image_bytes})
         
