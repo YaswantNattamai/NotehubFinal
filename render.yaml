@@ -2,15 +2,27 @@ services:
   - type: web
     name: notehub-backend
     env: docker
-    plan: free # or standard if you want persistent disks on Render
+    plan: free
     dockerContext: ./backend
     dockerfilePath: ./backend/Dockerfile
     envVars:
-      - key: DB_PATH
-        value: /app/data/notehub.db
+      - key: DATABASE_URL
+        fromDatabase:
+          name: notehub-db
+          property: connectionString
       - key: SECRET_KEY
         generateValue: true
-    disk:
-      name: notehub-data
-      mountPath: /app/data
-      sizeGB: 1
+      - key: AWS_REGION
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_BUCKET_NAME
+        sync: false
+
+databases:
+  - name: notehub-db
+    databaseName: notehub
+    user: notehub_user
+    plan: free
