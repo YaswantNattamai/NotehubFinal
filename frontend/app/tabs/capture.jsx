@@ -135,12 +135,20 @@ export default function CaptureScreen() {
       const formData = new FormData();
       if (!targetDocId) formData.append("title", title.trim());
       
-      photos.forEach((p, i) => {
-        formData.append(`image_${i}`, { uri: p.uri, name: `photo_${i}.jpg`, type: "image/jpeg" });
+      for (let i = 0; i < photos.length; i++) {
+        const p = photos[i];
+        
+        // On Web, we must fetch the blob from the blob URI or data URI
+        const response = await fetch(p.uri);
+        const blob = await response.blob();
+        
+        // Append the actual blob, not the React Native object
+        formData.append(`image_${i}`, blob, `photo_${i}.jpg`);
+        
         if (p.crop) {
           formData.append(`crop_${i}`, JSON.stringify(p.crop));
         }
-      });
+      }
 
       let res;
       if (targetDocId) {
