@@ -47,8 +47,13 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
 # Initialize clients (will use environment/IAM role credentials)
-textract = boto3.client("textract", region_name=AWS_REGION)
-s3 = boto3.client("s3", region_name=AWS_REGION)
+try:
+    textract = boto3.client("textract", region_name=AWS_REGION)
+    s3 = boto3.client("s3", region_name=AWS_REGION)
+except Exception as e:
+    print(f"AWS Client Init Error: {e}")
+    textract = None
+    s3 = None
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -226,7 +231,12 @@ def init_db():
     db.commit()
     db.close()
 
-init_db()
+try:
+    init_db()
+except Exception as e:
+    print(f"Database Initialization Error: {e}")
+    import traceback
+    traceback.print_exc()
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 

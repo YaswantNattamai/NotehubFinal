@@ -25,5 +25,5 @@ COPY . .
 # Create a directory for persistent data (SQLite)
 RUN mkdir -p /app/data
 
-# Run the application
-CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:8000"]
+# Run the application (using 2 workers max to prevent OOM on Free Tier)
+CMD ["gunicorn", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:8000"]
