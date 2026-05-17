@@ -165,6 +165,8 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
+    db.commit() # Commit the table creations before attempting migrations
+    
     # Migrations
     for query in [
         "ALTER TABLE users ADD COLUMN username TEXT",
@@ -177,6 +179,8 @@ def init_db():
             db.execute(query)
             db.commit()
         except Exception as e:
+            if db.is_postgres:
+                db.conn.rollback() # Reset the aborted transaction block
             # Ignore duplicate column errors
             if "duplicate" not in str(e).lower() and "already exists" not in str(e).lower():
                 print(f"Migration error for {query}: {e}")
@@ -187,7 +191,8 @@ def init_db():
         db.execute("ALTER TABLE channel_notes ADD COLUMN subheading TEXT")
         db.commit()
     except:
-        pass
+        if db.is_postgres:
+            db.conn.rollback()
         
     db.execute("""
         CREATE TABLE IF NOT EXISTS channel_notes (
