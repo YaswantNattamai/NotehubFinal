@@ -308,11 +308,11 @@ def send_otp_email(target_email: str, otp: str):
 class SignupRequest(BaseModel):
     name: str
     username: str
-    email: str
+    email: EmailStr
     password: str
 
 class LoginRequest(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 class UserResponse(BaseModel):
@@ -389,7 +389,7 @@ def signup(body: SignupRequest):
     return {"message": "Signup successful", "email": body.email, "is_verified": is_verified, "otp_debug": otp}
 
 class VerifyRequest(BaseModel):
-    email: str
+    email: EmailStr
     otp: str
 
 @app.post("/auth/verify")
